@@ -14,7 +14,7 @@ from curl_cffi.requests import Session, Response
 
 from ..config.constants import ERROR_MESSAGES
 from ..config.settings import get_settings
-from .openai.sentinel import SentinelPOWError, build_sentinel_pow_token
+from .openai.sentinel import SentinelPOWError, SentinelTokenGenerator
 
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ class RequestConfig:
     timeout: int = 30
     max_retries: int = 3
     retry_delay: float = 1.0
-    impersonate: str = "chrome"
+    impersonate: str = "chrome120"
     verify_ssl: bool = True
     follow_redirects: bool = True
 
@@ -259,12 +259,16 @@ class OpenAIHTTPClient(HTTPClient):
                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-site",
         }
+        self._sentinel_payloads: dict[tuple[str, str], dict[str, str]] = {}
 
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """
@@ -350,7 +354,28 @@ class OpenAIHTTPClient(HTTPClient):
         except cffi_requests.RequestsError as e:
             raise HTTPClientError(f"OpenAI 请求失败: {endpoint} - {e}")
 
-    def check_sentinel(self, did: str, proxies: Optional[Dict] = None) -> Optional[str]:
+    def build_sentinel_header(self, *, device_id: str, flow: str, token: str = "") -> str:
+        payload = self._sentinel_payloads.get((str(device_id or "").strip(), str(flow or "").strip()))
+        if payload:
+            return json.dumps(payload, separators=(",", ":"))
+        return json.dumps(
+            {
+                "p": "",
+                "t": "",
+                "c": str(token or "").strip(),
+                "id": str(device_id or "").strip(),
+                "flow": str(flow or "").strip(),
+            },
+            separators=(",", ":"),
+        )
+
+    def check_sentinel(
+        self,
+        did: str,
+        proxies: Optional[Dict] = None,
+        *,
+        flow: str = "authorize_continue",
+    ) -> Optional[str]:
         """
         检查 Sentinel 拦截
 
@@ -364,11 +389,16 @@ class OpenAIHTTPClient(HTTPClient):
         from ..config.constants import OPENAI_API_ENDPOINTS
 
         try:
-            pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
+            device_id = str(did or "").strip()
+            resolved_flow = str(flow or "authorize_continue").strip() or "authorize_continue"
+            generator = SentinelTokenGenerator(
+                device_id=device_id,
+                user_agent=self.default_headers.get("User-Agent", "Mozilla/5.0"),
+            )
             sen_req_body = json.dumps({
-                "p": pow_token,
-                "id": did,
-                "flow": "authorize_continue",
+                "p": generator.generate_requirements_token(),
+                "id": device_id,
+                "flow": resolved_flow,
             }, separators=(",", ":"))
 
             response = self.post(
@@ -377,12 +407,34 @@ class OpenAIHTTPClient(HTTPClient):
                     "origin": "https://sentinel.openai.com",
                     "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
                     "content-type": "text/plain;charset=UTF-8",
+                    "sec-ch-ua": self.default_headers.get("sec-ch-ua", ""),
+                    "sec-ch-ua-mobile": self.default_headers.get("sec-ch-ua-mobile", ""),
+                    "sec-ch-ua-platform": self.default_headers.get("sec-ch-ua-platform", ""),
                 },
                 data=sen_req_body,
             )
 
             if response.status_code == 200:
-                return response.json().get("token")
+                payload = response.json()
+                token = str(payload.get("token") or "").strip()
+                if not token:
+                    return None
+                pow_data = payload.get("proofofwork") or {}
+                if isinstance(pow_data, dict) and pow_data.get("required") and pow_data.get("seed"):
+                    p_value = generator.generate_token(
+                        seed=str(pow_data.get("seed") or ""),
+                        difficulty=str(pow_data.get("difficulty") or "0"),
+                    )
+                else:
+                    p_value = generator.generate_requirements_token()
+                self._sentinel_payloads[(device_id, resolved_flow)] = {
+                    "p": p_value,
+                    "t": "",
+                    "c": token,
+                    "id": device_id,
+                    "flow": resolved_flow,
+                }
+                return token
             else:
                 logger.warning(f"Sentinel 检查失败: {response.status_code}")
                 return None

@@ -3,96 +3,141 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import random
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Sequence
 
 
-DEFAULT_SENTINEL_DIFF = "0fffff"
 DEFAULT_MAX_ITERATIONS = 500_000
-_SCREEN_SIGNATURES = (3000, 3120, 4000, 4160)
-_LANGUAGE_SIGNATURE = "en-US,es-US,en,es"
-_NAVIGATOR_KEYS = ("location", "ontransitionend", "onprogress")
-_WINDOW_KEYS = ("window", "document", "navigator")
 
 
 class SentinelPOWError(RuntimeError):
     """Raised when a Sentinel proof-of-work token cannot be solved."""
 
 
-def _format_browser_time() -> str:
-    """Match the browser-style timestamp used by public Sentinel solvers."""
-    browser_now = datetime.now(timezone(timedelta(hours=-5)))
-    return browser_now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
+class SentinelTokenGenerator:
+    """Browser-like Sentinel challenge/PoW token generator."""
 
+    MAX_ATTEMPTS = DEFAULT_MAX_ITERATIONS
+    ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-def build_sentinel_config(user_agent: str) -> list:
-    """Build a browser-like fingerprint payload for the Sentinel PoW solver."""
-    perf_ms = time.perf_counter() * 1000
-    epoch_ms = (time.time() * 1000) - perf_ms
-    return [
-        random.choice(_SCREEN_SIGNATURES),
-        _format_browser_time(),
-        4294705152,
-        0,
-        user_agent,
-        "",
-        "",
-        "en-US",
-        _LANGUAGE_SIGNATURE,
-        0,
-        random.choice(_NAVIGATOR_KEYS),
-        "location",
-        random.choice(_WINDOW_KEYS),
-        perf_ms,
-        str(uuid.uuid4()),
-        "",
-        8,
-        epoch_ms,
-    ]
+    def __init__(self, *, device_id: str | None = None, user_agent: str | None = None) -> None:
+        self.device_id = device_id or str(uuid.uuid4())
+        self.user_agent = user_agent or "Mozilla/5.0"
+        self.requirements_seed = str(random.random())
+        self.sid = str(uuid.uuid4())
 
+    @staticmethod
+    def _fnv1a_32(text: str) -> str:
+        h = 2166136261
+        for ch in text:
+            h ^= ord(ch)
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 2246822507) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 3266489909) & 0xFFFFFFFF
+        h ^= h >> 16
+        return format(h & 0xFFFFFFFF, "08x")
 
-def _encode_pow_payload(config: Sequence[object], nonce: int) -> bytes:
-    prefix = (json.dumps(config[:3], separators=(",", ":"), ensure_ascii=False)[:-1] + ",").encode("utf-8")
-    middle = (
-        "," + json.dumps(config[4:9], separators=(",", ":"), ensure_ascii=False)[1:-1] + ","
-    ).encode("utf-8")
-    suffix = ("," + json.dumps(config[10:], separators=(",", ":"), ensure_ascii=False)[1:]).encode("utf-8")
-    body = prefix + str(nonce).encode("ascii") + middle + str(nonce >> 1).encode("ascii") + suffix
-    return base64.b64encode(body)
+    def _get_config(self) -> list[object]:
+        now_str = time.strftime(
+            "%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)",
+            time.gmtime(),
+        )
+        perf_now = random.uniform(1000, 50000)
+        time_origin = time.time() * 1000 - perf_now
+        nav_prop = random.choice(
+            [
+                "vendorSub",
+                "productSub",
+                "vendor",
+                "maxTouchPoints",
+                "scheduling",
+                "userActivation",
+                "doNotTrack",
+                "geolocation",
+                "connection",
+                "plugins",
+                "mimeTypes",
+                "pdfViewerEnabled",
+                "webkitTemporaryStorage",
+                "webkitPersistentStorage",
+                "hardwareConcurrency",
+                "cookieEnabled",
+                "credentials",
+                "mediaDevices",
+                "permissions",
+                "locks",
+                "ink",
+            ]
+        )
+        nav_val = f"{nav_prop}-undefined"
+        return [
+            "1920x1080",
+            now_str,
+            4294705152,
+            random.random(),
+            self.user_agent,
+            "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
+            None,
+            None,
+            "en-US",
+            "en-US,en",
+            random.random(),
+            nav_val,
+            random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
+            random.choice(["Object", "Function", "Array", "Number", "parseFloat", "undefined"]),
+            perf_now,
+            self.sid,
+            "",
+            random.choice([4, 8, 12, 16]),
+            time_origin,
+        ]
 
+    @staticmethod
+    def _base64_encode(data: object) -> str:
+        raw = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return base64.b64encode(raw).decode("ascii")
 
-def solve_sentinel_pow(
-    seed: str,
-    difficulty: str,
-    config: Sequence[object],
-    max_iterations: int = DEFAULT_MAX_ITERATIONS,
-) -> str:
-    """Solve the Sentinel PoW challenge and return the base64 payload."""
-    seed_bytes = seed.encode("utf-8")
-    target = bytes.fromhex(difficulty)
-    prefix_length = len(target)
+    def _run_check(
+        self,
+        *,
+        start_time: float,
+        seed: str,
+        difficulty: str,
+        config: list[object],
+        nonce: int,
+    ) -> str | None:
+        config[3] = nonce
+        config[9] = round((time.time() - start_time) * 1000)
+        data = self._base64_encode(config)
+        hash_hex = self._fnv1a_32(seed + data)
+        diff_len = len(difficulty)
+        if hash_hex[:diff_len] <= difficulty:
+            return data + "~S"
+        return None
 
-    for nonce in range(max_iterations):
-        encoded = _encode_pow_payload(config, nonce)
-        digest = hashlib.sha3_512(seed_bytes + encoded).digest()
-        if digest[:prefix_length] <= target:
-            return encoded.decode("ascii")
+    def generate_token(self, *, seed: str | None = None, difficulty: str | None = None) -> str:
+        start_time = time.time()
+        config = self._get_config()
+        resolved_seed = seed if seed is not None else self.requirements_seed
+        resolved_difficulty = str(difficulty or "0")
+        for nonce in range(self.MAX_ATTEMPTS):
+            result = self._run_check(
+                start_time=start_time,
+                seed=resolved_seed,
+                difficulty=resolved_difficulty,
+                config=config,
+                nonce=nonce,
+            )
+            if result:
+                return "gAAAAAB" + result
+        raise SentinelPOWError(f"failed to solve sentinel pow after {self.MAX_ATTEMPTS} attempts")
 
-    raise SentinelPOWError(f"failed to solve sentinel pow after {max_iterations} attempts")
-
-
-def build_sentinel_pow_token(
-    user_agent: str,
-    difficulty: str = DEFAULT_SENTINEL_DIFF,
-    max_iterations: int = DEFAULT_MAX_ITERATIONS,
-) -> str:
-    """Build the `p` token required by the Sentinel request endpoint."""
-    config = build_sentinel_config(user_agent)
-    seed = format(random.random())
-    solution = solve_sentinel_pow(seed, difficulty, config, max_iterations=max_iterations)
-    return f"gAAAAAC{solution}"
+    def generate_requirements_token(self) -> str:
+        config = self._get_config()
+        config[3] = 1
+        config[9] = round(random.uniform(5, 50))
+        return "gAAAAAC" + self._base64_encode(config)
